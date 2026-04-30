@@ -59,11 +59,10 @@ stats = {
     "start_time": None,
 }
 
-log_txt      = None
-log_csv      = None
-log_json_path = ""
-csv_writer   = None
-json_records = []
+log_txt    = None
+log_csv    = None
+log_json   = None
+csv_writer = None
 
 _stop_stats = threading.Event()
 
@@ -177,9 +176,11 @@ def identify_packet(pkt):
         return proto, src, dst, summary, eth_src, eth_dst
 
     if Dot11 in pkt:
-        proto = "802.11"
-        src   = pkt[Dot11].addr2 or "?"
-        dst   = pkt[Dot11].addr1 or "?"
+        proto   = "802.11"
+        src     = pkt[Dot11].addr2 or "?"
+        dst     = pkt[Dot11].addr1 or "?"
+        eth_src = src
+        eth_dst = dst
         if Dot11Beacon in pkt:
             ssid    = pkt[Dot11Beacon].network_stats().get("ssid", "?")
             summary = f"802.11 Beacon SSID={ssid}"
@@ -283,7 +284,7 @@ def packet_callback(pkt, args, iface):
         stats["by_proto"][proto] += 1
         stats["bytes"]        += len(pkt)
 
-    ts_str = datetime.fromtimestamp(float(pkt.time)).strftime("%H:%M:%S.%f")[:-3]
+    ts_str = datetime.fromtimestamp(float(pkt.time)).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     size   = len(pkt)
 
     record = {
@@ -321,8 +322,9 @@ def packet_callback(pkt, args, iface):
             csv_writer.writerow(record)
             log_csv.flush()
 
-        if log_json_path:
-            json_records.append(record)
+        if log_json:
+            log_json.write(json.dumps(record, ensure_ascii=False) + "\n")
+            log_json.flush()
 
 def _print_stats():
     with _lock:
@@ -350,10 +352,9 @@ def _close_logs():
         log_txt.close()
     if log_csv:
         log_csv.close()
-    if log_json_path:
-        with open(log_json_path, "w", encoding="utf-8") as f:
-            json.dump(json_records, f, indent=2, ensure_ascii=False)
-        print(f"[LOG] JSON guardado em {log_json_path}")
+    if log_json:
+        log_json.close()
+        print(f"[LOG] JSON guardado (JSON Lines)")
 
 def handle_sigint(sig, frame):
     print(f"\n{C.BOLD}{C.YELLOW}[*] Captura interrompida.{C.RESET}")
@@ -388,10 +389,132 @@ def parse_args():
     p.add_argument("--stats-interval",     type=int, default=0, help="Mostrar estatísticas de N em N segundos (0 = desativado)")
     return p.parse_args()
 
-def main():
-    global log_txt, log_csv, csv_writer, log_json_path, stats
+def interactive_setup():
+    """Menu interativo passo-a-passo para configurar a captura."""
 
-    args = parse_args()
+    def _ask(label, default=""):
+        suffix = f" [{default}]" if default != "" else ""
+        return input(f"  {C.CYAN}{label}{suffix}:{C.RESET} ").strip()
+
+    def _pick(label, options, default_idx=0):
+        """Mostra lista numerada e devolve o índice escolhido."""
+        for i, opt in enumerate(options):
+            marker = f"{C.GREEN}►{C.RESET}" if i == default_idx else " "
+            print(f"  {marker} {C.GREY}{i}.{C.RESET}  {opt}")
+        while True:
+            raw = _ask(label, str(default_idx))
+            if raw == "":
+                return default_idx
+            if raw.isdigit() and 0 <= int(raw) < len(options):
+                return int(raw)
+            print(f"    {C.RED}Escolhe um número entre 0 e {len(options)-1}.{C.RESET}")
+
+    def _ask_int(label, default=0, minimum=0):
+        while True:
+            raw = _ask(label, str(default))
+            if raw == "":
+                return default
+            try:
+                v = int(raw)
+                if v >= minimum:
+                    return v
+            except ValueError:
+                pass
+            print(f"    {C.RED}Número inteiro ≥ {minimum}.{C.RESET}")
+
+    print(f"\n{C.BOLD}{C.BLUE}╔{'═'*56}╗")
+    print(f"║{'RC-TP2  —  Packet Sniffer  —  Configuração Interativa':^56}║")
+    print(f"╚{'═'*56}╝{C.RESET}\n")
+
+    # ── 1. Interface ──────────────────────────────────────────
+    # Mostra apenas interfaces relevantes: loopback, Ethernet, Wi-Fi, VPN
+    _IFACE_PREFIXES = ("lo", "eth", "en", "wlan", "utun", "tun", "ppp", "ens", "enp", "wlp")
+    all_ifaces = get_if_list()
+    ifaces = [i for i in all_ifaces if any(i.startswith(p) for p in _IFACE_PREFIXES)]
+    if not ifaces:
+        ifaces = all_ifaces  # fallback se nenhum bater
+    default_iface = str(conf.iface)
+    default_idx = next((i for i, ifc in enumerate(ifaces) if ifc == default_iface), 0)
+    print(f"{C.BOLD}  [1] Interface de rede:{C.RESET}")
+    idx = _pick("Número", ifaces, default_idx)
+    iface = ifaces[idx]
+
+    # ── 2. Protocolo ──────────────────────────────────────────
+    PROTOS = ["TODOS", "ARP", "ICMP", "ICMPv6", "DNS", "DHCP", "HTTP", "TCP", "UDP", "802.11"]
+    print(f"\n{C.BOLD}  [2] Filtro de protocolo:{C.RESET}")
+    pidx = _pick("Número", PROTOS, 0)
+    proto = None if pidx == 0 else PROTOS[pidx]
+
+    # ── 3. Nº de pacotes ──────────────────────────────────────
+    print()
+    count = _ask_int("  [3] Nº de pacotes a capturar (0 = infinito)", 0)
+
+    # ── 4. Filtros opcionais ──────────────────────────────────
+    print(f"\n{C.BOLD}  [4] Filtros opcionais{C.RESET} {C.GREY}(Enter para ignorar cada campo){C.RESET}")
+    ip_filter  = _ask("Filtro por IP         (ex: 192.168.1.1)") or None
+    mac_filter = _ask("Filtro por MAC        (ex: aa:bb:cc:dd:ee:ff)") or None
+    while True:
+        bpf_raw = _ask("Filtro BPF  [texto!]  (ex: tcp port 80)") or None
+        if bpf_raw is None or not bpf_raw.strip().isdigit():
+            bpf_filter = bpf_raw
+            break
+        print(f"    {C.RED}BPF é uma expressão de texto (ex: 'udp', 'tcp port 443'), não um número.{C.RESET}")
+
+    # ── 5. Saída ──────────────────────────────────────────────
+    print(f"\n{C.BOLD}  [5] Saída{C.RESET}")
+    live_raw = _ask("Mostrar pacotes em tempo real? (s/n)", "s").lower()
+    live = live_raw != "n"
+    stats_interval = _ask_int("Estatísticas automáticas a cada N segundos (0 = desativado)", 0)
+
+    # ── 6. Logs ───────────────────────────────────────────────
+    print(f"\n{C.BOLD}  [6] Ficheiros de log{C.RESET} {C.GREY}(Enter para ignorar){C.RESET}")
+    log_txt_path  = _ask("Log TXT  (ex: captura.txt)") or None
+    log_csv_path  = _ask("Log CSV  (ex: captura.csv)") or None
+    log_json_path = _ask("Log JSON (ex: captura.json)") or None
+
+    # ── Resumo ────────────────────────────────────────────────
+    print(f"\n{C.BOLD}{C.GREEN}  Configuração selecionada:{C.RESET}")
+    print(f"    Interface  : {iface}")
+    print(f"    Protocolo  : {proto or 'todos'}")
+    print(f"    Filtro IP  : {ip_filter  or '—'}")
+    print(f"    Filtro MAC : {mac_filter or '—'}")
+    print(f"    Filtro BPF : {bpf_filter or '—'}")
+    print(f"    Count      : {count or '∞'}")
+    print(f"    Live       : {'sim' if live else 'não'}")
+    print(f"    Stats      : {'a cada ' + str(stats_interval) + 's' if stats_interval else 'desativado'}")
+    if log_txt_path:  print(f"    Log TXT    : {log_txt_path}")
+    if log_csv_path:  print(f"    Log CSV    : {log_csv_path}")
+    if log_json_path: print(f"    Log JSON   : {log_json_path}")
+
+    input(f"\n  {C.GREY}Prima Enter para iniciar a captura...{C.RESET} ")
+
+    return argparse.Namespace(
+        iface=iface,
+        count=count,
+        proto=proto,
+        ip=ip_filter,
+        mac=mac_filter,
+        bpf=bpf_filter,
+        live=live,
+        stats_interval=stats_interval,
+        log_txt=log_txt_path,
+        log_csv=log_csv_path,
+        log_json=log_json_path,
+        list_ifaces=False,
+    )
+
+
+def main():
+    global log_txt, log_csv, log_json, csv_writer, stats
+
+    if len(sys.argv) == 1:
+        try:
+            args = interactive_setup()
+        except KeyboardInterrupt:
+            print(f"\n{C.YELLOW}[*] Cancelado.{C.RESET}")
+            sys.exit(0)
+    else:
+        args = parse_args()
 
     if args.list_ifaces:
         list_interfaces()
@@ -419,7 +542,7 @@ def main():
         print(f"  Log CSV    : {args.log_csv}")
 
     if args.log_json:
-        log_json_path = args.log_json
+        log_json = open(args.log_json, "w", encoding="utf-8")
         print(f"  Log JSON   : {args.log_json}")
 
     print(f"\n{C.GREY}{'─'*150}")
@@ -434,13 +557,24 @@ def main():
         t.start()
         print(f"  Stats      : a cada {args.stats_interval}s\n")
 
-    sniff(
-        iface=iface,
-        filter=args.bpf,
-        prn=lambda p: packet_callback(p, args, iface),
-        count=args.count if args.count > 0 else 0,
-        store=False,
-    )
+    try:
+        sniff(
+            iface=iface,
+            filter=args.bpf,
+            prn=lambda p: packet_callback(p, args, iface),
+            count=args.count if args.count > 0 else 0,
+            store=False,
+        )
+    except Exception as e:
+        err = str(e)
+        if "filter" in err.lower() or "bpf" in err.lower() or "compile" in err.lower():
+            print(f"\n{C.RED}[ERRO] Filtro BPF inválido: '{args.bpf}'{C.RESET}")
+            print(f"       Exemplos válidos: 'tcp', 'udp', 'tcp port 80', 'host 192.168.1.1'")
+        else:
+            print(f"\n{C.RED}[ERRO] {e}{C.RESET}")
+        _stop_stats.set()
+        _close_logs()
+        sys.exit(1)
 
     _stop_stats.set()
     _print_stats()
