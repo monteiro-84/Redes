@@ -122,6 +122,8 @@ sudo python3 sniffer.py -i eth0 --no-live
 sudo python3 sniffer.py -i eth0 --stats-interval 10
 ```
 
+No final da captura (ou em `Ctrl+C`) é também impressa uma **tabela de hierarquia de protocolos** com a distribuição dos pacotes pelas várias camadas (Frame → Ethernet → IPv4/IPv6 → TCP/UDP → HTTP/HTTPS/DNS/DHCP, etc.), com percentagem de pacotes e bytes em cada camada.
+
 ### Logging e persistência
 
 Os três formatos podem estar ativos simultaneamente.
@@ -240,7 +242,30 @@ sudo dhclient -r wlp0s20f3 && sudo dhclient wlp0s20f3
 | DNS | UDP porta 53 | Query/Response, nome pedido, endereços devolvidos |
 | DHCP | UDP portas 67/68 | Tipo (DORA), IP atribuído, hostname |
 | HTTP | TCP porta 80/8080 | Método, host, path (pedidos); código de estado (respostas) |
+| HTTPS | TCP porta 443 | Distinguido na tabela de hierarquia (payload cifrado) |
 | TCP | IPv4/IPv6 | Flags (SYN, ACK, FIN, RST, PSH, URG), seq, ack |
 | UDP | IPv4/IPv6 | Portas origem/destino, tamanho |
 | IPv6 | Ethernet | Endereços, next-header |
 | IEEE 802.11 | Modo monitor | Beacon (SSID), Probe Request |
+
+---
+
+## Tabela de hierarquia de protocolos
+
+No final de cada captura (ou ao premir `Ctrl+C`), o sniffer imprime uma tabela com a distribuição dos pacotes pelas camadas do modelo, semelhante à *Protocol Hierarchy Statistics* do Wireshark. Cada linha mostra a percentagem de pacotes, número absoluto de pacotes, percentagem de bytes e número de bytes em cada camada:
+
+```
+Hierarquia de Protocolos
+  Protocolo             % Pacotes   Pacotes  % Bytes        Bytes
+  ─────────────────────────────────────────────────────────────────
+  Frame                    100.0%       150   100.0%       18,420
+    Ethernet               100.0%       150   100.0%       18,420
+      IPv4                  92.0%       138    93.5%       17,222
+        TCP                 60.0%        90    72.0%       13,262
+          HTTPS             45.0%        68    65.0%       11,973
+        UDP                 28.0%        42    18.0%        3,316
+          DNS               25.0%        38    16.0%        2,947
+      ARP                    8.0%        12     6.5%        1,198
+```
+
+A indentação reflete o encapsulamento: cada camada inferior está contida na superior. Permite identificar de imediato a composição do tráfego capturado.
