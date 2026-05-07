@@ -59,6 +59,29 @@ stats = {
     "start_time": None,
 }
 
+hier_stats = defaultdict(lambda: {"pkts": 0, "bytes": 0})
+
+HIER_NODES = [
+    ("frame",  "Frame",    0),
+    ("eth",    "Ethernet", 1),
+    ("arp",    "ARP",      2),
+    ("ipv4",   "IPv4",     2),
+    ("icmp",   "ICMP",     3),
+    ("tcp4",   "TCP",      3),
+    ("http",   "HTTP",     4),
+    ("https",  "HTTPS",    4),
+    ("udp4",   "UDP",      3),
+    ("dns4",   "DNS",      4),
+    ("dhcp",   "DHCP",     4),
+    ("ipv6",   "IPv6",     2),
+    ("icmpv6", "ICMPv6",   3),
+    ("tcp6",   "TCP",      3),
+    ("udp6",   "UDP",      3),
+    ("dns6",   "DNS",      4),
+    ("dot11",  "802.11",   2),
+    ("other",  "Other",    1),
+]
+
 log_txt    = None
 log_csv    = None
 log_json   = None
@@ -257,6 +280,58 @@ def _dhcp_info(pkt, src, dst, eth_src, eth_dst):
     return "DHCP", ciaddr, dst, summary, eth_src, eth_dst
 
 
+def _get_hier_layers(pkt):
+    """Devolve a lista de chaves de camada presentes no pacote (para a tabela de hierarquia)."""
+    layers = ["frame"]
+
+    if Ether in pkt:
+        layers.append("eth")
+    elif Dot11 in pkt:
+        layers.append("dot11")
+        return layers
+    else:
+        layers.append("other")
+        return layers
+
+    if ARP in pkt:
+        layers.append("arp")
+        return layers
+
+    if IP in pkt:
+        layers.append("ipv4")
+        if ICMP in pkt:
+            layers.append("icmp")
+        elif TCP in pkt:
+            layers.append("tcp4")
+            sp, dp = pkt[TCP].sport, pkt[TCP].dport
+            if 443 in (sp, dp):
+                layers.append("https")
+            elif set((sp, dp)) & {80, 8080} and (HTTPRequest in pkt or HTTPResponse in pkt):
+                layers.append("http")
+        elif UDP in pkt:
+            layers.append("udp4")
+            if DNS in pkt:
+                layers.append("dns4")
+            elif DHCP in pkt:
+                layers.append("dhcp")
+        return layers
+
+    if IPv6 in pkt:
+        layers.append("ipv6")
+        if ICMPv6EchoRequest in pkt or ICMPv6EchoReply in pkt:
+            layers.append("icmpv6")
+        elif TCP in pkt:
+            layers.append("tcp6")
+        elif UDP in pkt:
+            layers.append("udp6")
+            if DNS in pkt:
+                layers.append("dns6")
+        return layers
+
+    layers.append("other")
+    return layers
+
+
 def packet_callback(pkt, args, iface):
     global packet_counter
 
@@ -279,15 +354,18 @@ def packet_callback(pkt, args, iface):
         if args.mac.lower() not in macs:
             return
 
+    size = len(pkt)
     with _lock:
         packet_counter           += 1
         n                         = packet_counter
         stats["total"]           += 1
         stats["by_proto"][proto] += 1
-        stats["bytes"]           += len(pkt)
+        stats["bytes"]           += size
+        for _layer in _get_hier_layers(pkt):
+            hier_stats[_layer]["pkts"]  += 1
+            hier_stats[_layer]["bytes"] += size
 
     ts_str = datetime.fromtimestamp(float(pkt.time)).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    size   = len(pkt)
 
     record = {
         "n":         n,
@@ -351,6 +429,37 @@ def _print_stats():
     print()
 
 
+def _print_hierarchy_table():
+    with _lock:
+        snap = {k: (v["pkts"], v["bytes"]) for k, v in hier_stats.items()}
+
+    total_pkts  = snap.get("frame", (0, 0))[0]
+    total_bytes = snap.get("frame", (0, 0))[1]
+    if total_pkts == 0:
+        return
+
+    W = 42
+    print(f"\n{C.BOLD}{'─'*80}")
+    print("  Hierarquia de Protocolos")
+    print(f"{'─'*80}{C.RESET}")
+    print(f"{C.BOLD}  {'Protocolo':<{W}} {'% Pacotes':>10} {'Pacotes':>10} {'% Bytes':>9} {'Bytes':>12}{C.RESET}")
+    print(f"  {'-'*W} {'-'*10} {'-'*10} {'-'*9} {'-'*12}")
+
+    for key, name, indent in HIER_NODES:
+        if key not in snap:
+            continue
+        pkts, nbytes = snap[key]
+        if pkts == 0:
+            continue
+        pct_p = pkts   / total_pkts  * 100
+        pct_b = nbytes / total_bytes * 100 if total_bytes else 0
+        label = "  " * indent + name
+        print(f"  {label:<{W}} {pct_p:>9.1f}% {pkts:>10,} {pct_b:>8.1f}% {nbytes:>12,}")
+
+    print(f"  {'═'*W} {'═'*10} {'═'*10} {'═'*9} {'═'*12}")
+    print()
+
+
 def _close_logs():
     if log_txt:
         log_txt.close()
@@ -365,6 +474,7 @@ def handle_sigint(sig, frame):
     print(f"\n{C.BOLD}{C.YELLOW}[*] Captura interrompida.{C.RESET}")
     _stop_stats.set()
     _print_stats()
+    _print_hierarchy_table()
     _close_logs()
     sys.exit(0)
 
@@ -581,6 +691,7 @@ def main():
 
     _stop_stats.set()
     _print_stats()
+    _print_hierarchy_table()
     _close_logs()
 
 
